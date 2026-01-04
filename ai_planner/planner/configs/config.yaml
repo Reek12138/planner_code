@@ -1,0 +1,8 @@
+defaults:
+  - data: data
+  - train: train
+  - model: model/hier_qformer
+  - hydra: hydra/default
+
+# 也可以放通用随机种子等
+seed: 42

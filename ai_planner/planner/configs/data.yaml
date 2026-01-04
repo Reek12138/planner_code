@@ -1,0 +1,5 @@
+data:
+  train_json: /path/to/train.jsonl        # 每行一个样本（见下文 schema）
+  val_json:   /path/to/val.jsonl
+  num_workers: 4
+  T_fixed: 16                              # 训练时 pad/截断到的最大帧数（给 encoder）

@@ -1,0 +1,31 @@
+model:
+  _target_: models.modeling.trajectory_model.TrajectoryModel
+  T_fixed: ${data.T_fixed}
+
+  encoder:
+    _target_: models.encoder.vision_encoder.VisionEncoderBatched
+    proj_dim: 1024
+    backbone:
+      _target_: models.encoder.vision_encoder.QwenVitBackbone
+      vit_dir: /home/zhuyi/planner_code/ai_planner/utils/qwen3_vit_only
+      proc_dir: /home/zhuyi/planner_code/qwen3_vl_instruct_2B
+      image_size: [448, 448]
+      freeze_backbone: true
+
+  decoder:
+    _target_: models.decoder.qformer.HierTrajectoryQFormer
+    d_vis: ${model.encoder.proj_dim}
+    d_q: 1024
+    nhead: 8
+    layers: 4
+    H: 12
+    K: 3
+    Nq: 64
+    Tmax: ${data.T_fixed}
+    sp_mode: fourier
+    tp_mode: sincos
+
+  loss:
+    _target_: losses.ade_fde.ADEFDELoss   # 换成 losses.ade.ADELoss / losses.bok.BestOfKHuber / losses.nll_gaussian.GaussianNLL
+    w_ade: 1.0
+    w_fde: 0.5

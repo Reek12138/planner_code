@@ -1,0 +1,12 @@
+train:
+  output_dir: ./outputs/hier_qformer
+  batch_size: 2
+  grad_accum: 1
+  lr: 5e-4
+  weight_decay: 0.01
+  num_epochs: 10
+  fp16: true
+  logging_steps: 50
+  save_steps: 1000
+  eval_steps: 500
+  dataloader_num_workers: 4
