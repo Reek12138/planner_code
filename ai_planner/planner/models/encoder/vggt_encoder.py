@@ -33,12 +33,14 @@ import torch.nn as nn
 # vggt 目录：
 #   /home/zhuyi/planner_code/third_party/vggt
 # =============================================================================
-_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.abspath(os.path.join(_CUR_DIR, "../../../../"))  # -> /home/zhuyi/planner_code
-_VGGT_ROOT = os.path.join(_PROJECT_ROOT, "third_party", "vggt")
+# _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+# _PROJECT_ROOT = os.path.abspath(os.path.join(_CUR_DIR, "../../../../"))  
+# _VGGT_ROOT = os.path.join(_PROJECT_ROOT, "third_party", "vggt")
 
-if _VGGT_ROOT not in sys.path:
-    sys.path.insert(0, _VGGT_ROOT)
+# if _VGGT_ROOT not in sys.path:
+#     sys.path.insert(0, _VGGT_ROOT)
+
+sys.path.insert(0, "/workspace/zhuy25@xiaopeng.com/planner_code/third_party/vggt")
 
 # 现在可以正常 import 原版 vggt
 from vggt.models.aggregator import Aggregator  # noqa: E402
@@ -172,7 +174,7 @@ class VGGTFrameEncoder(nn.Module):
         Returns:
             feat:
                 Tensor [B, S, P, 2C]
-                - P = camera + register + patch tokens
+                - P = camera + 4*register + patch tokens
                 - 2C = frame-attn + global-attn concat
             patch_start_idx:
                 int
@@ -209,7 +211,7 @@ if __name__ == "__main__":
     H, W = 518, 518
     images = torch.rand(B, S, 3, H, W, device=device)
 
-    ckpt_path = "/home/zhuyi/planner_code/third_party/ckpt/aggregator/vggt_aggregator.pt"
+    ckpt_path = "/workspace/zhuy25@xiaopeng.com/planner_code/third_party/ckpt/aggregator/vggt_aggregator.pt"
     if not os.path.isfile(ckpt_path):
         ckpt_path = None  # 不存在就不加载
 

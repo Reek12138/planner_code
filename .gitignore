@@ -1,0 +1,69 @@
+############################
+# Python cache
+############################
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+############################
+# Env / IDE
+############################
+.venv/
+venv/
+env/
+conda/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+############################
+# Logs / runtime / cache
+############################
+*.log
+logs/
+wandb/
+runs/
+tensorboard/
+outputs/
+results/
+checkpoints/
+ckpt/
+cache/
+tmp/
+
+############################
+# Large ML artifacts
+############################
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.trt
+*.npz
+*.npy
+
+############################
+# datasets (全部不上传)
+############################
+datasets/**
+
+############################
+# third_party（白名单策略）
+############################
+third_party/**
+!third_party/ckpt/
+!third_party/ckpt/check_pth.py
+!third_party/ckpt/save_aggregator.py
+
+############################
+# train（排除指定脚本）
+############################
+train/run2fuyao.sh

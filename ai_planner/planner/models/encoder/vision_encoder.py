@@ -1,377 +1,344 @@
+# /workspace/zhuy25@xiaopeng.com/planner_code/ai_planner/planner/models/encoder/vision_encoder.py
 # -*- coding: utf-8 -*-
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union
-from collections import deque
-from PIL import Image
 
-from transformers import AutoConfig, AutoProcessor
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+# NEW: activation checkpointing
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 
-# ========= 抽象主干接口 =========
-class VisionBackbone(nn.Module):
+# ----------------------------
+# utils
+# ----------------------------
+def _to_b_s_3_h_w(images: torch.Tensor) -> torch.Tensor:
     """
-    视觉主干抽象接口：输入单帧图像，输出 (tokens, deepstack_list, coords_uv)
-      - tokens: [N_tokens, D_backbone] （注意：这里的 tokens 是“合并（merger）之后”的）
-      - deepstack_list: List[[N_tokens_l, D_backbone]]（可选）
-      - coords_uv: [N_tokens, 2]，与 tokens 一一对应，(u,v)∈[0,1]，行优先（row-major）
+    Accept:
+      - [B,S,3,H,W]
+      - [S,3,H,W]   -> treat as B=1
+      - [B,3,H,W]   -> treat as S=1
+    Return: [B,S,3,H,W]
     """
-    def encode_pil(self, img: Image.Image) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-        raise NotImplementedError
+    if images.dim() == 5:
+        return images
+    if images.dim() == 4:
+        # could be [S,3,H,W] or [B,3,H,W]
+        # assume [S,3,H,W] if first dim small and channel==3 at dim1
+        if images.shape[1] == 3:
+            return images.unsqueeze(0)  # [1,S,3,H,W]
+        if images.shape[0] == 3:
+            return images.unsqueeze(0).unsqueeze(1)  # [1,1,3,H,W]
+        raise ValueError(f"ambiguous 4D images shape: {tuple(images.shape)}")
+    raise ValueError(f"images must be 4D/5D, got {tuple(images.shape)}")
 
-    @property
-    def out_dim(self) -> int:
-        raise NotImplementedError
 
-
-# ========= Qwen3-VL ViT 主干实现（固定 resize 后再经 processor；返回合并后 token + 坐标） =========
-class QwenVitBackbone(VisionBackbone):
-    """
-    使用 Qwen3VLVisionModel 作为视觉主干。
-    - 进入 processor 之前先把图片固定缩放到 image_size（默认 448×448）
-    - 不依赖 processor 返回的 grid_thw；按固定尺寸+patch_size 构造 grid_thw
-    - 依据 spatial_merge_size 计算“合并后网格”的 (u,v) 坐标并返回
-    """
-    def __init__(
-        self,
-        vit_dir: str,
-        proc_dir: str,
-        device: Optional[str] = None,
-        dtype: Optional[torch.dtype] = None,
-        image_size: Tuple[int, int] = (448, 448),
-        freeze_backbone: bool = True,
-    ):
+class MLP(nn.Module):
+    def __init__(self, dim: int, hidden: int, dropout: float):
         super().__init__()
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = dtype or (torch.float16 if torch.cuda.is_available() else torch.float32)
-        self.image_size = image_size
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(dropout)
 
-        # 1) 加载 ViT-only
-        cfg = AutoConfig.from_pretrained(vit_dir)
-        self.vit = Qwen3VLVisionModel(cfg)
-        state = torch.load(f"{vit_dir}/pytorch_model.bin", map_location="cpu")
-        self.vit.load_state_dict(state, strict=True)
-        self.vit.to(self.device, dtype=self.dtype)
-        self.vit.eval()
-
-        if freeze_backbone:
-            for p in self.vit.parameters():
-                p.requires_grad = False
-
-        # 2) Processor（仅用于标准化；resize 已由我们手动完成）
-        self.processor = AutoProcessor.from_pretrained(proc_dir)
-        # 记录输出维度（来自 merger 输出维度）
-        self._out_dim = cfg.out_hidden_size
-
-        # 关键参数：patch 与 merge
-        self.patch_size = int(getattr(cfg, "patch_size", 14))
-        self.merge_size = int(getattr(cfg, "spatial_merge_size", 2))
-
-        # 固定网格（所有图片一致）
-        H, W = self.image_size
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, \
-            f"image_size 必须是 patch_size 的整数倍；当前 {self.image_size} / patch_size={self.patch_size}"
-        self.H_p = H // self.patch_size
-        self.W_p = W // self.patch_size
-
-        # 合并后网格大小
-        assert self.H_p % self.merge_size == 0 and self.W_p % self.merge_size == 0, \
-            f"(H_p, W_p)=({self.H_p},{self.W_p}) 需能被 merge_size={self.merge_size} 整除"
-        self.Hm = self.H_p // self.merge_size
-        self.Wm = self.W_p // self.merge_size
-        self.N_tokens = self.Hm * self.Wm
-
-        # 预先生成“合并后网格”的归一化 (u,v) 坐标模板（行优先）
-        yy, xx = torch.meshgrid(
-            torch.arange(self.Hm, device=self.device),
-            torch.arange(self.Wm, device=self.device),
-            indexing="ij"
-        )
-        u = (xx.to(self.dtype) + 0.5) / float(self.Wm)
-        v = (yy.to(self.dtype) + 0.5) / float(self.Hm)
-        self.coords_template = torch.stack([u, v], dim=-1).reshape(-1, 2)  # [N,2]
-
-    @torch.no_grad()
-    def encode_pil(self, img: Image.Image) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-        # 先固定 resize，再交给 processor
-        img = img.convert("RGB").resize(self.image_size, Image.BICUBIC)
-
-        # 关键：用 processor 的 grid_thw，保证与 patch_embed 对齐
-        proc_out = self.processor(images=[img], text=[""], return_tensors="pt")
-        pix  = proc_out["pixel_values"].to(self.device, dtype=self.dtype)     # [1,3,H,W]
-        grid = proc_out["image_grid_thw"].to(self.device)                     # [[T,H_p,W_p]]
-
-        merged_feats, deepstack_feats = self.vit(pix, grid_thw=grid)          # [N_merge, D]
-
-        # 用“真实 grid_thw + merge_size”算合并后坐标（行优先）
-        T, H_p, W_p = grid[0].tolist()
-        m = int(self.vit.config.spatial_merge_size)
-        Hm, Wm = H_p // m, W_p // m
-        yy, xx = torch.meshgrid(
-            torch.arange(Hm, device=self.device),
-            torch.arange(Wm, device=self.device),
-            indexing="ij",
-        )
-        u = (xx.to(self.dtype) + 0.5) / float(Wm)
-        v = (yy.to(self.dtype) + 0.5) / float(Hm)
-        coords_one = torch.stack([u, v], dim=-1).reshape(-1, 2)   # [Hm*Wm,2]
-        coords_uv  = coords_one.repeat(int(T), 1)                 # [T*Hm*Wm,2] == merged_feats.shape[0]
-
-        return merged_feats, deepstack_feats, coords_uv
-
-    @torch.no_grad()
-    def encode_pil_batch(self, imgs: List[Image.Image]) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 统一 resize（保证视觉尺寸稳定）
-        resized = [im.convert("RGB").resize(self.image_size, Image.BICUBIC) for im in imgs]
-
-        proc = self.processor(images=resized, text=[""] * len(resized), return_tensors="pt")
-        pix  = proc["pixel_values"].to(self.device, dtype=self.dtype)          # [M,3,H,W]
-        grid = proc["image_grid_thw"].to(self.device)                           # [M,3]
-
-        merged_feats, _ = self.vit(pix, grid_thw=grid)                          # [sum_i N_i_merge, D]
-        D = merged_feats.size(-1)
-        m = int(self.vit.config.spatial_merge_size)
-
-        # 计算每张图的合并后 token 数 N_i = T_i * (H_p/m) * (W_p/m)
-        Ns = []
-        for (T, H_p, W_p) in grid.tolist():
-            Ns.append(int(T) * (H_p // m) * (W_p // m))
-
-        # 按 N_i 拆分
-        feats_list = list(torch.split(merged_feats, Ns, dim=0))
-
-        # 生成每张图的 coords，并 pad 到 N_max（若你确认 Ns 全相等，可以直接 stack）
-        coords_list = []
-        for (T, H_p, W_p) in grid.tolist():
-            Hm, Wm = (H_p // m), (W_p // m)
-            yy, xx = torch.meshgrid(
-                torch.arange(Hm, device=self.device),
-                torch.arange(Wm, device=self.device),
-                indexing="ij",
-            )
-            u = (xx.to(self.dtype) + 0.5) / float(Wm)
-            v = (yy.to(self.dtype) + 0.5) / float(Hm)
-            coords_one = torch.stack([u, v], dim=-1).reshape(-1, 2)   # [Hm*Wm,2]
-            coords_list.append(coords_one.repeat(int(T), 1))          # [N_i,2]
-
-        N_max = max(Ns)
-        feats_padded  = []
-        coords_padded = []
-        for f, c in zip(feats_list, coords_list):
-            n = f.size(0)
-            if n < N_max:
-                feats_padded.append(F.pad(f, (0, 0, 0, N_max - n)))   # [N_max,D]
-                coords_padded.append(F.pad(c, (0, 0, 0, N_max - n)))  # [N_max,2]
-            else:
-                feats_padded.append(f)
-                coords_padded.append(c)
-
-        feats_padded  = torch.stack(feats_padded,  dim=0)             # [M,N_max,D]
-        coords_padded = torch.stack(coords_padded, dim=0)             # [M,N_max,2]
-
-        # 如果你已经固定了 processor 的尺寸策略，通常 Ns 都相等，此时你也可以：
-        # feats_padded = merged_feats.view(M, N_max, D); coords_padded = coords_list[0].unsqueeze(0).repeat(M,1,1)
-
-        # 这里返回共享的模板更方便：若 Ns 全相等，就返回 coords_padded[0]
-        if len(set(Ns)) == 1:
-            return feats_padded, coords_padded[0]
-        else:
-            # 若仍有不等，下游就用 coords_padded 按 batch 取（你可以把返回签名改为返回 coords_padded）
-            return feats_padded, coords_padded[0]  # 或改成返回 coords_padded
-
-    @property
-    def out_dim(self) -> int:
-        return self._out_dim
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
 
-# ========= 训练期：Batched 编码器 =========
-class VisionEncoderBatched(nn.Module):
-    """
-    训练期推荐：一次性把 B*T 张图过主干，reshape 回 [B, T, N, D_proj]
-    并返回 frame_mask、coords_uv。
-    """
-    def __init__(self, backbone: VisionBackbone, proj_dim: Optional[int] = None):
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, dim: int, nhead: int, dropout: float):
         super().__init__()
-        self.backbone = backbone
-        d_in = backbone.out_dim
-        if proj_dim is not None and proj_dim != d_in:
-            self.proj = nn.Linear(d_in, proj_dim, bias=True).to(
-                next(backbone.parameters()).device,
-                dtype=next(backbone.parameters()).dtype,
-            )
-            self.out_dim = proj_dim
-        else:
-            self.proj = nn.Identity()
-            self.out_dim = d_in
+        assert dim % nhead == 0
+        self.dim = dim
+        self.nhead = nhead
+        self.head_dim = dim // nhead
 
-        self._coords_uv_template: Optional[torch.Tensor] = None  # [N,2]
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
 
-    @torch.no_grad()
-    def _encode_images_backbone(self, imgs: List[Image.Image]):
-        feats, coords_uv = self.backbone.encode_pil_batch(imgs)   # [M,N,D_b], [N,2]
-        return feats, coords_uv
-
-    def encode_batch_sequences(
-        self,
-        batch_seqs: List[List[Image.Image]],
-        T_fixed: Optional[int] = None,
-    ):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         """
-        输入：batch 的图像序列（长度B，每个是长度Ti的PIL列表）
-        输出：
-          feats: [B, T_max, N, D_proj]
-          frame_mask: [B, T_max]  (True=pad)
-          coords_uv: [N, 2]
+        x: [B, N, D]
+        attn_mask: optional, broadcastable to [B, nhead, N, N] with 0/-inf style masks
         """
-        # 1) pad 到同一长度
-        T_list = [len(seq) for seq in batch_seqs]
-        T_max = T_fixed or max(T_list)
-        pad_img = Image.new("RGB", self.backbone.image_size)
-        imgs_flat, mask = [], []
-        for seq in batch_seqs:
-            cur = seq[:T_max] + [pad_img] * max(0, T_max - len(seq))
-            imgs_flat.extend(cur)
-            mask.append([False]*min(len(seq), T_max) + [True]*max(0, T_max - len(seq)))
+        B, N, D = x.shape
+        qkv = self.qkv(x)  # [B,N,3D]
+        qkv = qkv.view(B, N, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,h,N,dh]
 
-        # 2) 主干一次过 B*T_max（主干冻结可 no_grad；投影层要梯度）
-        with torch.no_grad():
-            feats_m, coords_uv = self._encode_images_backbone(imgs_flat)  # [B*T,N,D_b], [N,2]
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B,h,N,N]
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-        # 3) 线性投影（需要梯度）
-        feats_m = self.proj(feats_m)  # [B*T,N,D_proj]
-
-        # 4) reshape 回 [B, T_max, N, D]
-        B = len(batch_seqs)
-        N = feats_m.shape[1]
-        D = feats_m.shape[2]
-        feats = feats_m.view(B, T_max, N, D).contiguous()               # [B,T,N,D]
-        frame_mask = torch.tensor(mask, device=feats.device)            # [B,T]
-
-        return feats, frame_mask, coords_uv.to(feats.device, feats.dtype)
-
-    # 可选：把 encode_batch_sequences 作为 forward 语义（按需）
-    def forward(self, batch_seqs: List[List[Image.Image]], T_fixed: Optional[int] = None):
-        return self.encode_batch_sequences(batch_seqs, T_fixed=T_fixed)
+        out = attn @ v  # [B,h,N,dh]
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
 
 
-# ========= 推理期：FIFO 编码器（可选，实时/滑窗） =========
-class VisionEncoderFIFO(nn.Module):
+class TransformerBlock(nn.Module):
     """
-    在线/实时场景：维护最近 T 帧窗口。
-    返回 [T, N, D_proj]；支持取 coords_uv 模板。
+    Pre-Norm Transformer block: LN -> MHA -> residual -> LN -> MLP -> residual
     """
-    def __init__(
-        self,
-        backbone: VisionBackbone,
-        fifo_len: int = 6,
-        proj_dim: Optional[int] = None,
-        use_mean_pool: bool = False,
-    ):
+    def __init__(self, dim: int, nhead: int, mlp_ratio: float, dropout: float):
         super().__init__()
-        self.backbone = backbone
-        self.fifo_len = fifo_len
-        self.use_mean_pool = use_mean_pool
-        self._buffer: deque[torch.Tensor] = deque(maxlen=fifo_len)  # 每项: [N, D_proj或D_backbone]
-        self._coords_uv: Optional[torch.Tensor] = None
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = MultiheadSelfAttention(dim, nhead, dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, int(dim * mlp_ratio), dropout)
 
-        d_in = backbone.out_dim
-        if proj_dim is not None and proj_dim != d_in:
-            self.proj = nn.Linear(d_in, proj_dim, bias=True).to(
-                next(backbone.parameters()).device,
-                dtype=next(backbone.parameters()).dtype,
-            )
-            self.out_dim = proj_dim
+    def forward(self, x: torch.Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+# ----------------------------
+# 4-frame ViT encoder
+# ----------------------------
+@dataclass
+class ViT4FrameEncoderConfig:
+    img_size: int = 518
+    patch_size: int = 14
+    in_chans: int = 3
+    num_frames: int = 4
+
+    embed_dim: int = 1024      # 你想对齐 vggt_embed_dim -> 输出会是 2*embed_dim
+    out_dim: Optional[int] = None  # 默认 None -> 2*embed_dim
+
+    nhead: int = 16            # embed_dim=1024 时 16 头比较常见（每头 64d）
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
+
+    # depth:
+    spatial_layers: int = 6    # 帧内 attention 层数
+    temporal_layers: int = 2   # 跨帧 attention 层数（每个 patch 位置沿时间做 attn）
+
+    use_cls_token: bool = True
+    use_time_embed: bool = True
+    init_std: float = 0.02
+
+
+class ViT4FrameEncoder(nn.Module):
+    """
+    输入:
+      images: [B,S,3,H,W] (S=4)
+    输出:
+      feat: [B,S,N,2*embed_dim]，其中 N = 1+P (若 use_cls_token=True)
+      patch_start_idx: int (use_cls_token -> 1 else 0)
+
+    结构:
+      1) PatchEmbed per frame -> tokens
+      2) Spatial transformer blocks: within each frame (帧内 attn)
+      3) Temporal transformer blocks: for each token index (including CLS if enabled),
+         apply attention across frames (跨帧 attn)
+    """
+    def __init__(self, cfg: ViT4FrameEncoderConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.img_size = cfg.img_size
+        self.patch_size = cfg.patch_size
+        self.num_frames = cfg.num_frames
+        self.embed_dim = cfg.embed_dim
+        self.out_dim = cfg.out_dim if cfg.out_dim is not None else (2 * cfg.embed_dim)
+        self.use_cls = cfg.use_cls_token
+
+        assert cfg.img_size % cfg.patch_size == 0, "img_size must be divisible by patch_size"
+        self.grid = cfg.img_size // cfg.patch_size
+        self.num_patches = self.grid * self.grid
+        self.patch_start_idx = 1 if self.use_cls else 0
+
+        # NEW: activation checkpointing switches (default OFF)
+        self.gradient_checkpointing = False
+        self.gc_use_reentrant = False
+
+        # Patch projection (conv as linear patch embed)
+        self.patch_proj = nn.Conv2d(
+            cfg.in_chans, cfg.embed_dim,
+            kernel_size=cfg.patch_size,
+            stride=cfg.patch_size,
+            bias=True
+        )
+
+        # CLS token
+        if self.use_cls:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.embed_dim))
         else:
-            self.proj = nn.Identity()
-            self.out_dim = d_in
+            self.cls_token = None
 
-    @torch.no_grad()
-    def _encode_one(self, img: Image.Image):
-        tokens, _deepstack, coords = self.backbone.encode_pil(img)     # [N,D_b], _, [N,2]
-        tokens = tokens.to(next(self.backbone.parameters()).device)
-        coords = coords.to(tokens.device, dtype=torch.float16 if tokens.dtype==torch.float16 else torch.float32)
-        return tokens, coords
+        # Spatial pos embedding (shared across frames)
+        # shape: [1, 1+P, D] or [1,P,D]
+        n_tokens = self.num_patches + (1 if self.use_cls else 0)
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_tokens, cfg.embed_dim))
 
-    def push(self, img: Union[str, Image.Image]) -> torch.Tensor:
-        if isinstance(img, str):
-            img = Image.open(img)
-        with torch.no_grad():
-            tokens, coords = self._encode_one(img)
-        tokens = self.proj(tokens)                                     # [N,D_proj]
-        self._buffer.append(tokens.detach())
-        if self._coords_uv is None:
-            self._coords_uv = coords.detach()
-        return tokens
+        # Time embedding (added before temporal blocks)
+        if cfg.use_time_embed:
+            self.time_embed = nn.Parameter(torch.zeros(1, cfg.num_frames, 1, cfg.embed_dim))  # [1,S,1,D]
+        else:
+            self.time_embed = None
 
-    def clear(self):
-        self._buffer.clear()
+        self.pos_drop = nn.Dropout(cfg.dropout)
 
-    def get_patch_coords(self) -> torch.Tensor:
-        assert self._coords_uv is not None, "请先 push 至少一帧以建立坐标模板"
-        return self._coords_uv  # [N,2]
+        # Spatial blocks (帧内)
+        self.spatial_blocks = nn.ModuleList([
+            TransformerBlock(cfg.embed_dim, cfg.nhead, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.spatial_layers)
+        ])
 
-    def get_sequence(self, with_coords: bool = False):
-        assert len(self._buffer) > 0, "FIFO 当前为空，请先 push 至少一帧。"
-        seq = torch.stack(list(self._buffer), dim=0)  # [T,N,D]
-        if self.use_mean_pool:
-            seq = seq.mean(dim=1)                     # [T,D]
-            if with_coords:
-                raise ValueError("use_mean_pool=True 时没有 token 维，无法返回坐标")
-            return seq
-        if with_coords:
-            return seq, self.get_patch_coords()
-        return seq
+        # Temporal blocks (跨帧)：沿时间维度做 self-attn
+        self.temporal_blocks = nn.ModuleList([
+            TransformerBlock(cfg.embed_dim, cfg.nhead, cfg.mlp_ratio, cfg.dropout)
+            for _ in range(cfg.temporal_layers)
+        ])
 
-    @torch.no_grad()
-    def forward(self, img: Union[str, Image.Image]) -> torch.Tensor:
-        self.push(img)
-        return self.get_sequence()
+        # Final projection to match "2*embed_dim" style output expected by your connector
+        self.out_proj = nn.Linear(cfg.embed_dim, self.out_dim)
+
+        self._init_weights(cfg.init_std)
+
+    # NEW: public API (huggingface-like)
+    def gradient_checkpointing_enable(self, enabled: bool = True, use_reentrant: bool = False):
+        """
+        Enable/disable activation checkpointing (block-level).
+        This does NOT change model architecture; it only wraps blocks with torch.utils.checkpoint during training.
+        """
+        self.gradient_checkpointing = bool(enabled)
+        self.gc_use_reentrant = bool(use_reentrant)
+        return self
+
+    def gradient_checkpointing_disable(self):
+        return self.gradient_checkpointing_enable(False)
+
+    def _init_weights(self, std: float):
+        if self.use_cls:
+            nn.init.normal_(self.cls_token, std=std)
+        nn.init.normal_(self.pos_embed, std=std)
+        if self.time_embed is not None:
+            nn.init.normal_(self.time_embed, std=std)
+
+        # conv/linear init: match common ViT init
+        nn.init.xavier_uniform_(self.patch_proj.weight)
+        if self.patch_proj.bias is not None:
+            nn.init.zeros_(self.patch_proj.bias)
+
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+        # blocks
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # already covered by some; safe
+                pass
+
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B*S,3,H,W] -> tokens: [B*S,P,D]
+        """
+        x = self.patch_proj(x)                 # [B*S, D, Gh, Gw]
+        x = x.flatten(2).transpose(1, 2)       # [B*S, P, D]
+        return x
+
+    def _run_block(self, blk: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """
+        Helper: run a TransformerBlock with optional activation checkpointing.
+        """
+        if self.gradient_checkpointing and self.training:
+            # checkpoint requires that at least one input has requires_grad=True (usually true in training)
+            return _ckpt(blk, x, use_reentrant=self.gc_use_reentrant)
+        return blk(x)
+
+    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        images = _to_b_s_3_h_w(images)  # [B,S,3,H,W]
+        B, S, C, H, W = images.shape
+        if S != self.num_frames:
+            raise ValueError(f"expected S={self.num_frames} frames, got S={S}")
+        if H != self.img_size or W != self.img_size:
+            raise ValueError(f"expected H=W={self.img_size}, got H={H}, W={W}")
+
+        # ---- 1) patch embed per frame ----
+        x = images.reshape(B * S, C, H, W)
+        tok = self._patchify(x)  # [B*S, P, D]
+
+        # add CLS per frame
+        if self.use_cls:
+            cls = self.cls_token.expand(B * S, -1, -1)  # [B*S,1,D]
+            tok = torch.cat([cls, tok], dim=1)          # [B*S,1+P,D]
+
+        # add spatial pos emb (same for each frame)
+        tok = tok + self.pos_embed
+        tok = self.pos_drop(tok)
+
+        # ---- 2) spatial blocks (帧内 attention) ----
+        for blk in self.spatial_blocks:
+            tok = self._run_block(blk, tok)  # [B*S, N, D]
+
+        # reshape back to [B,S,N,D]
+        tok = tok.view(B, S, tok.shape[1], tok.shape[2])  # [B,S,N,D]
+
+        # ---- 3) temporal blocks (跨帧 attention) ----
+        tok_t = tok.permute(0, 2, 1, 3).contiguous()  # [B,N,S,D]
+
+        if self.time_embed is not None:
+            tok_t = tok_t + self.time_embed.permute(0, 2, 1, 3)  # [1,1,S,D] broadcast
+
+        tok_t = tok_t.view(B * tok_t.shape[1], S, tok_t.shape[3])  # [B*N, S, D]
+
+        for blk in self.temporal_blocks:
+            tok_t = self._run_block(blk, tok_t)  # [B*N, S, D]
+
+        # reshape back to [B,N,S,D] then to [B,S,N,D]
+        tok_t = tok_t.view(B, -1, S, self.embed_dim)            # [B,N,S,D]
+        tok = tok_t.permute(0, 2, 1, 3).contiguous()            # [B,S,N,D]
+
+        # ---- 4) output projection to match connector in_dim ----
+        feat = self.out_proj(tok)  # [B,S,N,out_dim] where out_dim defaults to 2*embed_dim
+
+        return feat, self.patch_start_idx
 
 
-# ================= Demo =================
+# ----------------------------
+# minimal quick test
+# ----------------------------
 if __name__ == "__main__":
-    # 路径替换成你的
-    vit_dir = "/home/zhuyi/planner_code/ai_planner/utils/qwen3_vit_only"
-    proc_dir = "/home/zhuyi/planner_code/qwen3_vl_instruct_2B"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    backbone = QwenVitBackbone(
-        vit_dir=vit_dir,
-        proc_dir=proc_dir,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        image_size=(224, 224),
-        freeze_backbone=True,
+    cfg = ViT4FrameEncoderConfig(
+        img_size=518,
+        patch_size=14,
+        num_frames=4,
+        embed_dim=128,
+        out_dim=None,
+        nhead=8,
+        spatial_layers=4,
+        temporal_layers=2,
+        dropout=0.0,
+        use_cls_token=True,
+        use_time_embed=True,
     )
+    enc = ViT4FrameEncoder(cfg).to(device)
 
-    # ===== 训练期：批处理 =====
-    encoder_b = VisionEncoderBatched(backbone=backbone, proj_dim=1024).eval()
+    # enable checkpointing for test
+    enc.gradient_checkpointing_enable(True, use_reentrant=False)
+    enc.train()
 
-    # 假造一个 batch：B=2，每条序列 T=[4,6]
-    img_path = "/home/zhuyi/Pictures/Figure_1.png"
-    seq1 = [Image.open(img_path)] * 3
-    seq2 = [Image.open(img_path)] * 3
-    feats, frame_mask, coords_uv = encoder_b([seq1, seq2])  # [B,T,N,D], [B,T], [N,2]
+    B, S = 2, 4
+    x = torch.randn(B, S, 3, 518, 518, device=device, requires_grad=True)
+    feat, patch_start_idx = enc(x)
+    loss = feat.mean()
+    loss.backward()
 
-    print("[Batched] feats:", tuple(feats.shape))
-    print("[Batched] frame_mask:", tuple(frame_mask.shape), "sum_mask=", frame_mask.sum().item())
-    print("[Batched] coords_uv:", tuple(coords_uv.shape))
-
-    # ===== 推理期：FIFO =====
-    encoder_f = VisionEncoderFIFO(backbone=backbone, fifo_len=6, proj_dim=1024, use_mean_pool=False).eval()
-    for _ in range(6):
-        encoder_f.push(img_path)
-    seq_f, coords_f = encoder_f.get_sequence(with_coords=True)
-    print("[FIFO] seq:", tuple(seq_f.shape))
-    print("[FIFO] coords:", tuple(coords_f.shape))
-
-    # 主干是否冻结
-    n_trainable = sum(p.requires_grad for p in backbone.parameters())
-    print("主干可训练参数数目:", n_trainable)  # 应为 0
-
-    # 投影层可训练参数
-    n_trainable_proj_b = sum(p.requires_grad for p in encoder_b.proj.parameters())
-    n_trainable_proj_f = sum(p.requires_grad for p in encoder_f.proj.parameters())
-    print("投影层(训练版)可训练参数数目:", n_trainable_proj_b)
-    print("投影层(FIFO)可训练参数数目:", n_trainable_proj_f)
+    print("feat:", feat.shape, "patch_start_idx:", patch_start_idx)
+    print("grad ok:", enc.patch_proj.weight.grad is not None)

@@ -1,13 +1,13 @@
 import sys
-_VGGT_ROOT = "/home/zhuyi/planner_code/third_party/vggt"
+_VGGT_ROOT = "/workspace/zhuy25@xiaopeng.com/planner_code/third_party/vggt"
 if _VGGT_ROOT not in sys.path:
     sys.path.insert(0, _VGGT_ROOT)
 
 import torch
 from vggt.models.vggt import VGGT
 
-ckpt_dir = "/home/zhuyi/planner_code/third_party/ckpt/vggt"  # 本地模型目录
-save_path = "/home/zhuyi/planner_code/third_party/ckpt/aggregator/vggt_aggregator.pt"
+ckpt_dir = "/publicdata/huggingface.co/facebook/VGGT-1B"  # 本地模型目录
+save_path = "/workspace/zhuy25@xiaopeng.com/planner_code/third_party/ckpt/aggregator/vggt_aggregator.pt"
 
 model = VGGT.from_pretrained(ckpt_dir, map_location="cuda")
 print("model loaded")
