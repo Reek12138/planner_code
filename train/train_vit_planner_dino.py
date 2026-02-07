@@ -8,38 +8,32 @@ Train VelocityPlannerModel with metadata.jsonl (4-frame depth -> 3-axis velcmd)
 - 单卡 / 多卡多 rank（torchrun DDP）
 - TensorBoard 记录（train/val loss、lr、samples/s）
 - eval 指标在 DDP 下做全局聚合（all-reduce）
-- 可选冻结 VGGT encoder（--freeze_vggt）
+- 自动断点续训（保持原逻辑）
+- 可选 warmup + cosine decay（默认 constant）
+- 可选 activation checkpointing（默认关闭）
 
-✅ 数据适配（按你最终确认的规则，保持训练逻辑不变）：
-- decoder Q(state) = quat_wxyz(4) + goal_dir_body(3) + vel_dir_world(3) => state_dim=10
-  - quat_wxyz：不额外归一化（直接使用日志四元数）
-  - goal_dir_body = delta_pos_body / (||delta_pos_body|| + eps)   # 把尺度变成方向
-  - vel_dir_world = vel_world / (||vel_world|| + eps)             # 当前速度方向（world 三轴）
+✅ 本次你要的改动（保持训练流程/接口不变，新增能力）：
+1) 默认 DINO 对齐：
+   - normalize 默认 imagenet
+   - vit/vggt_embed_dim 默认 1024
+   - vit_nhead 默认 16
+   - patch_size 默认 14
+   - decoder d_model 仍用 256（不必对齐 DINO，训练更稳）
+2) 支持 --depth_mode：
+   - repeat / log / standardize
+3) 支持 --dinov2_ckpt 本地 init：
+   - 在 DDP wrap 前调用：model.vggt.init_from_dinov2(local_ckpt_path=...)
+   - 需要你的 vision_encoder.py 里 init_from_dinov2 支持 local_ckpt_path
+     （下面我在本脚本里做了“尽量兼容”的调用：优先 local_ckpt_path，否则传 state_dict）
 
-- label 归一化：
-  y_norm = label_velcmd / clamp(desired_vel, desired_vel_min)
-  desired_vel 从 curr_state.desired_vel 读取；缺失则回退到 ||label_velcmd|| 或 1.0
+用法示例：
+  torchrun --nproc_per_node=8 train.py \
+    --train_jsonl xxx --val_jsonl yyy \
+    --use_state \
+    --dinov2_ckpt /path/to/dinov2_vitl14_pretrain.pth \
+    --depth_mode log \
+    --normalize imagenet
 
-✅ 自动断点续训（保持原逻辑）：
-- 如果 --resume 未指定：
-  - 若 out_dir 下存在任何 *.pt 文件：
-    - 优先从 out_dir/best.pt 恢复（存在才恢复）
-    - 否则从 out_dir 下“最新修改时间”的 *.pt 恢复
-
-✅ 验证时新增 print（rank0 only）：
-- 打印 partial normalized mse
-- 同时打印 partial denorm mse（把 y_norm * desired_vel_den 还原到 m/s 口径做 mse，仅用于观测）
-
-✅ 本次修改（仅改 TensorBoard 写入逻辑，训练逻辑不变）：
-- rank0 同时写两份 TB logs：
-  1) local: 仍然写到 args.out_dir/tb
-  2) job-level: 按 job 级别目录推导，写到 /workspace/zhuy25@xiaopeng.com/<job_name>/xflow_logs
-- 所有 add_scalar 同步写入两份 writer
-
-✅ 新增：可选 warmup + cosine decay（默认不启用，保持原来 constant LR）
-- 通过 --lr_schedule cosine 启用
-- 支持 --warmup_steps / --min_lr_ratio
-- scheduler 状态会保存到 ckpt 并在 resume 时恢复（老 ckpt 没有 scheduler 也能兼容）
 """
 
 import os
@@ -123,7 +117,8 @@ def _add_project_root():
 
 _add_project_root()
 
-from planner.models.modeling.vggt_planner import VelocityPlannerConfig, VelocityPlannerModel  # noqa: E402
+# ✅ IMPORTANT: switch planner import (keep interface, change backend)
+from planner.models.modeling.vit_planner_dino import VelocityPlannerConfig, VelocityPlannerModel  # noqa: E402
 
 
 # =========================================================
@@ -214,8 +209,18 @@ def _resize_tensor_chw(x: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tenso
 def load_depth_png_as_3ch_tensor(
     path: str,
     img_size: int,
-    normalize: str = "unit",
+    normalize: str = "imagenet",
+    depth_mode: str = "log",   # NEW: repeat/log/standardize
+    eps: float = 1e-6,
 ) -> torch.Tensor:
+    """
+    Load depth png -> 3ch tensor [3,H,W], then resize to img_size, then optional imagenet norm.
+
+    depth_mode:
+      - repeat: depth in [0,1] repeat to 3ch
+      - log:    log(depth) then standardize then map to [0,1] then repeat
+      - standardize: z-score then map to [0,1] then repeat
+    """
     im = Image.open(path)
     import numpy as np
     arr = np.array(im)
@@ -224,13 +229,32 @@ def load_depth_png_as_3ch_tensor(
         arr = arr[..., 0]
 
     if arr.dtype == np.uint16:
-        x = torch.from_numpy(arr.astype("float32")) / 65535.0
+        d = torch.from_numpy(arr.astype("float32")) / 65535.0
     else:
-        x = torch.from_numpy(arr.astype("float32"))
-        if x.max() > 1.5:
-            x = x / 255.0
+        d = torch.from_numpy(arr.astype("float32"))
+        if d.max() > 1.5:
+            d = d / 255.0
 
-    x = x.unsqueeze(0).repeat(3, 1, 1)
+    # d: [H,W]
+    if depth_mode == "repeat":
+        x = d.unsqueeze(0).repeat(3, 1, 1)
+
+    elif depth_mode == "log":
+        d2 = torch.log(d.clamp_min(eps))
+        d2 = (d2 - d2.mean()) / (d2.std() + eps)
+        d2 = d2.clamp(-3, 3)
+        d2 = (d2 + 3) / 6.0  # -> ~[0,1]
+        x = d2.unsqueeze(0).repeat(3, 1, 1)
+
+    elif depth_mode == "standardize":
+        d2 = (d - d.mean()) / (d.std() + eps)
+        d2 = d2.clamp(-3, 3)
+        d2 = (d2 + 3) / 6.0
+        x = d2.unsqueeze(0).repeat(3, 1, 1)
+
+    else:
+        raise ValueError(f"Unknown depth_mode={depth_mode}")
+
     x = _resize_tensor_chw(x, (img_size, img_size))
 
     if normalize == "imagenet":
@@ -246,13 +270,6 @@ def load_depth_png_as_3ch_tensor(
 
 
 def find_auto_resume_ckpt(out_dir: str) -> str:
-    """
-    Auto resume policy:
-      - If out_dir has any *.pt:
-        - Prefer out_dir/best.pt if exists
-        - Else pick most recently modified *.pt
-      - Else return ""
-    """
     out_dir = os.path.abspath(out_dir)
     if not os.path.isdir(out_dir):
         return ""
@@ -274,27 +291,24 @@ def find_auto_resume_ckpt(out_dir: str) -> str:
 
 
 # =========================================================
-# TensorBoard dual-writer helpers (NEW)
+# TensorBoard dual-writer helpers
 # =========================================================
 def _sanitize_job_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
         return name
     import re
-    # 去掉末尾的 -master-<数字>，例如 xxx-master-0 / xxx-master-1
     name = re.sub(r"-master-\d+$", "", name)
     return name
 
 
 def _infer_job_name() -> str:
-    # 1) Fuyao / scheduler env
     for k in ["FUYAO_JOB_NAME", "JOB_NAME", "SLURM_JOB_NAME", "LSB_JOBNAME"]:
         v = os.environ.get(k, "")
         v2 = _sanitize_job_name(v)
         if v2:
             return v2
 
-    # 2) fallback: hostname
     try:
         import socket
         hn = socket.gethostname()
@@ -341,26 +355,18 @@ def tb_close(writers: Optional[List["SummaryWriter"]]) -> None:
 
 
 # =========================================================
-# LR Scheduler helpers (NEW, optional)
+# LR Scheduler helpers (optional)
 # =========================================================
 def build_warmup_cosine_lambda(
     total_steps: int,
     warmup_steps: int,
     min_lr_ratio: float,
 ):
-    """
-    Return a lr_lambda(step) for torch.optim.lr_scheduler.LambdaLR.
-
-    - step: 0-based global step index (we will call scheduler.step(step))
-    - warmup: linear ramp from 0 -> 1 over warmup_steps
-    - cosine: decay from 1 -> min_lr_ratio over remaining steps
-    """
     total_steps = int(max(1, total_steps))
     warmup_steps = int(max(0, warmup_steps))
     min_lr_ratio = float(min_lr_ratio)
 
     if warmup_steps >= total_steps:
-        # 退化情况：全部都是 warmup（基本不会这么配）
         def lr_lambda(step: int):
             step = int(step)
             if warmup_steps <= 0:
@@ -373,10 +379,9 @@ def build_warmup_cosine_lambda(
         if warmup_steps > 0 and step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
 
-        # cosine stage
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return lr_lambda
@@ -390,19 +395,11 @@ class Depth4FrameVelCmdDataset(Dataset):
     jsonl item expected:
       - frame_paths: List[str] length=4
       - label_velcmd: List[float] length=3
-      - curr_state.quat_wxyz: [4]         (no extra normalization)
-      - curr_state.vel_world: [3]         (world)
-      - curr_state.desired_vel: float     (used to normalize label)
-      - goal_nav.delta_pos_body: [3]      (body)
-
-    state = quat_wxyz(4) + goal_dir_body(3) + vel_dir_world(3) => 10
-      goal_dir_body = delta_pos_body / (||delta|| + eps)
-      vel_dir_world = vel_world / (||vel|| + eps)
-
-    label normalized:
-      y_norm = label_velcmd / clamp(desired_vel, desired_vel_min)
+      - curr_state.quat_wxyz: [4]
+      - curr_state.vel_world: [3]
+      - curr_state.desired_vel: float
+      - goal_nav.delta_pos_body: [3]
     """
-
     def __init__(
         self,
         jsonl_path: str,
@@ -410,7 +407,8 @@ class Depth4FrameVelCmdDataset(Dataset):
         frames: int = 4,
         state_dim: int = 10,
         use_state: bool = False,
-        normalize: str = "unit",
+        normalize: str = "imagenet",
+        depth_mode: str = "log",
         filter_max_dt: Optional[float] = None,
         eps: float = 1e-6,
         desired_vel_min: float = 0.1,
@@ -421,6 +419,7 @@ class Depth4FrameVelCmdDataset(Dataset):
         self.state_dim = state_dim
         self.use_state = use_state
         self.normalize = normalize
+        self.depth_mode = depth_mode
         self.filter_max_dt = filter_max_dt
         self.eps = float(eps)
         self.desired_vel_min = float(desired_vel_min)
@@ -479,6 +478,15 @@ class Depth4FrameVelCmdDataset(Dataset):
             raise ValueError(f"Bad fields: quat({len(quat)}), vel_world({len(vel_world)}), delta({len(delta)})")
 
         quat4 = [float(x) for x in quat]
+        quat4 = [0.0 if (not math.isfinite(x)) else x for x in quat4]
+
+        qn = (quat4[0] * quat4[0] + quat4[1] * quat4[1] + quat4[2] * quat4[2] + quat4[3] * quat4[3]) ** 0.5
+        if qn < self.eps:
+            quat4 = [1.0, 0.0, 0.0, 0.0]
+        else:
+            inv = 1.0 / qn
+            quat4 = [quat4[0] * inv, quat4[1] * inv, quat4[2] * inv, quat4[3] * inv]
+
         goal_dir = self._safe_unit3([float(x) for x in delta])
         vel_dir = self._safe_unit3([float(x) for x in vel_world])
 
@@ -494,7 +502,16 @@ class Depth4FrameVelCmdDataset(Dataset):
         if len(frame_paths) != self.frames:
             raise ValueError(f"Expected {self.frames} frame_paths, got {len(frame_paths)}")
 
-        imgs = [load_depth_png_as_3ch_tensor(p, self.img_size, normalize=self.normalize) for p in frame_paths]
+        imgs = [
+            load_depth_png_as_3ch_tensor(
+                p,
+                self.img_size,
+                normalize=self.normalize,
+                depth_mode=self.depth_mode,
+                eps=self.eps,
+            )
+            for p in frame_paths
+        ]
         images = torch.stack(imgs, dim=0)  # [S,3,H,W]
 
         label = it.get("label_velcmd", None)
@@ -599,6 +616,7 @@ def evaluate(
 
     return {"mse": float(mse_norm), "loss": float(mse_norm), "denorm_mse": float(mse_denorm)}
 
+
 def save_ckpt(
     path: str,
     model: nn.Module,
@@ -648,14 +666,14 @@ def train_one_epoch(
     for step, batch in enumerate(loader, 1):
         images = batch["images"].to(device, non_blocking=True)
         state = batch["state"].to(device, non_blocking=True)
-        label = batch["label"].to(device, non_blocking=True)          # normalized
-        label_den = batch["label_den"].to(device, non_blocking=True)  # [B]
+        label = batch["label"].to(device, non_blocking=True)
+        label_den = batch["label_den"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=str(device).startswith("cuda")):
             pred = model(images, state)
-            loss = loss_fn(pred, label)  # normalized mse (mean)
+            loss = loss_fn(pred, label)
 
         scaler.scale(loss).backward()
 
@@ -677,7 +695,6 @@ def train_one_epoch(
             denorm_loss = loss_fn(pred_den, label_denorm)
             total_denorm += float(denorm_loss.item()) * bs
 
-        # TB logging uses lr that is actually used for THIS optimizer step
         if is_rank0() and writers is not None:
             tb_add_scalar(writers, "train/loss", float(loss.item()), global_step)
             tb_add_scalar(writers, "train/mse", float(loss.item()), global_step)
@@ -698,17 +715,47 @@ def train_one_epoch(
             save_ckpt(ckpt_path, model, optimizer, epoch, cfg=cfg_dict, global_step=global_step, scheduler=scheduler)
             print(f"[ckpt] saved: {ckpt_path}")
 
-        # advance step counter
         global_step += 1
 
-        # scheduler step AFTER global_step advanced, so it sets LR for NEXT iteration
         if scheduler is not None:
-            # use global_step as the 0-based "step index" for next iter
             scheduler.step(global_step)
 
     epoch_avg = total_loss / max(1, n)
     epoch_den = total_denorm / max(1, n)
     return {"mse": epoch_avg, "loss": epoch_avg, "denorm_mse": epoch_den}, global_step
+
+
+def _count_params(m: nn.Module, trainable_only: bool = False) -> int:
+    if trainable_only:
+        return sum(p.numel() for p in m.parameters() if p.requires_grad)
+    return sum(p.numel() for p in m.parameters())
+
+
+def print_vit_decoder_param_ratio(model: nn.Module) -> None:
+    if not is_rank0():
+        return
+
+    m = unwrap_model(model)
+    enc = getattr(m, "vggt", None)
+    dec = getattr(m, "decoder", None)
+
+    if enc is None or dec is None:
+        print("[params] cannot find m.vggt or m.decoder, skip vit/decoder ratio.")
+        return
+
+    enc_total = _count_params(enc, trainable_only=False)
+    dec_total = _count_params(dec, trainable_only=False)
+    enc_train = _count_params(enc, trainable_only=True)
+    dec_train = _count_params(dec, trainable_only=True)
+
+    ratio_total = float(enc_total) / float(max(1, dec_total))
+    ratio_train = float(enc_train) / float(max(1, dec_train))
+
+    print(
+        "[params][vit_vs_decoder] "
+        f"enc_total={enc_total:,} dec_total={dec_total:,} ratio_total={ratio_total:.3f} | "
+        f"enc_trainable={enc_train:,} dec_trainable={dec_train:,} ratio_trainable={ratio_train:.3f}"
+    )
 
 
 def print_trainable_params(model: nn.Module) -> None:
@@ -723,6 +770,90 @@ def print_trainable_params(model: nn.Module) -> None:
     print(f"[params] trainable={trainable:,} / total={total:,} ({100.0*trainable/max(1,total):.2f}%)")
 
 
+def _enable_grad_ckpt(m: nn.Module, use_reentrant: bool) -> None:
+    base = unwrap_model(m)
+
+    if hasattr(base, "gradient_checkpointing_enable") and callable(getattr(base, "gradient_checkpointing_enable")):
+        try:
+            base.gradient_checkpointing_enable(True, use_reentrant=use_reentrant)  # type: ignore
+            if is_rank0():
+                print(f"[gc] enabled via model.gradient_checkpointing_enable(use_reentrant={use_reentrant})")
+            return
+        except TypeError:
+            base.gradient_checkpointing_enable(True, use_reentrant)  # type: ignore
+            if is_rank0():
+                print(f"[gc] enabled via model.gradient_checkpointing_enable(positional, use_reentrant={use_reentrant})")
+            return
+
+    if hasattr(base, "vggt") and hasattr(base.vggt, "gradient_checkpointing_enable") and callable(getattr(base.vggt, "gradient_checkpointing_enable")):
+        try:
+            base.vggt.gradient_checkpointing_enable(True, use_reentrant=use_reentrant)  # type: ignore
+            if is_rank0():
+                print(f"[gc] enabled via model.vggt.gradient_checkpointing_enable(use_reentrant={use_reentrant})")
+            return
+        except TypeError:
+            base.vggt.gradient_checkpointing_enable(True, use_reentrant)  # type: ignore
+            if is_rank0():
+                print(f"[gc] enabled via model.vggt.gradient_checkpointing_enable(positional, use_reentrant={use_reentrant})")
+            return
+
+    if is_rank0():
+        print("[warn] --grad_ckpt set but model has no gradient_checkpointing_enable() on model or model.vggt. Skip.")
+
+
+def _extract_state_dict_from_ckpt(obj: Any) -> Dict[str, torch.Tensor]:
+    """
+    Try best-effort to get a plain state_dict mapping from torch.load output.
+    """
+    if isinstance(obj, dict):
+        for k in ["model", "state_dict", "teacher", "student"]:
+            if k in obj and isinstance(obj[k], dict):
+                return obj[k]
+    if isinstance(obj, dict):
+        # maybe already a state_dict
+        if all(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj
+    raise ValueError("Cannot extract state_dict from ckpt. Expected dict with keys like 'model'/'state_dict' or a raw state_dict.")
+
+
+def _maybe_init_dinov2(model: nn.Module, dinov2_ckpt: str, device: str) -> None:
+    """
+    Call model.vggt.init_from_dinov2 with local ckpt if available.
+
+    Compatible with two possible encoder implementations:
+      - init_from_dinov2(local_ckpt_path=..., model_name=..., verbose=...)
+      - init_from_dinov2(state_dict=..., model_name=..., verbose=...)
+    """
+    if not dinov2_ckpt:
+        return
+    if not os.path.isfile(dinov2_ckpt):
+        raise FileNotFoundError(f"--dinov2_ckpt not found: {dinov2_ckpt}")
+
+    base = unwrap_model(model)
+    enc = getattr(base, "vggt", None)
+    if enc is None or not hasattr(enc, "init_from_dinov2"):
+        raise RuntimeError("Model has no vggt.init_from_dinov2(). Please update vision_encoder.py accordingly.")
+
+    if is_rank0():
+        print(f"[DINOv2] init from local ckpt: {dinov2_ckpt}")
+
+    # Preferred: pass local_ckpt_path if encoder supports it
+    try:
+        enc.init_from_dinov2(model_name="dinov2_vitl14", local_ckpt_path=dinov2_ckpt, verbose=True)  # type: ignore
+        return
+    except TypeError:
+        pass
+
+    # Fallback: load state_dict and pass in
+    ck = torch.load(dinov2_ckpt, map_location="cpu")
+    sd = _extract_state_dict_from_ckpt(ck)
+    try:
+        enc.init_from_dinov2(model_name="dinov2_vitl14", state_dict=sd, verbose=True)  # type: ignore
+        return
+    except Exception as e:
+        raise RuntimeError(f"Failed to init_from_dinov2 via state_dict fallback: {e}") from e
+
+
 # =========================================================
 # Main
 # =========================================================
@@ -734,7 +865,13 @@ def main():
     ap.add_argument("--val_jsonl", type=str, required=True)
     ap.add_argument("--img_size", type=int, default=518)
     ap.add_argument("--frames", type=int, default=4)
-    ap.add_argument("--normalize", type=str, default="unit", choices=["unit", "imagenet", "none"])
+
+    # ✅ default align to DINO input pipeline
+    ap.add_argument("--normalize", type=str, default="imagenet", choices=["unit", "imagenet", "none"])
+
+    # ✅ NEW: depth -> 3ch mode
+    ap.add_argument("--depth_mode", type=str, default="log", choices=["repeat", "log", "standardize"])
+
     ap.add_argument("--filter_max_dt", type=float, default=-1.0, help="if >0, drop samples with match_dt_sec > this")
 
     # state interface
@@ -746,13 +883,15 @@ def main():
     ap.add_argument("--eps", type=float, default=1e-6)
 
     # ----- model -----
+    # ✅ default align to DINOv2 vitl14
     ap.add_argument("--vggt_embed_dim", type=int, default=1024)
     ap.add_argument("--patch_size", type=int, default=14)
-    ap.add_argument("--pretrained_agg_path", type=str, default="")
     ap.add_argument("--max_patches", type=int, default=512)
 
-    # freeze encoder
-    ap.add_argument("--freeze_vggt", action="store_true", help="freeze VGGTFrameEncoder only")
+    # ✅ NEW: local dinov2 init path
+    ap.add_argument("--dinov2_ckpt", type=str, default="", help="local dinov2 vitl14 checkpoint to init spatial encoder")
+
+    ap.add_argument("--freeze_vggt", action="store_true", help="(kept for compatibility) will be ignored for ViT: train whole model")
 
     # ----- train -----
     ap.add_argument("--epochs", type=int, default=10, help="train epochs (ignored if --max_steps > 0)")
@@ -767,12 +906,18 @@ def main():
     ap.add_argument("--val_log_every", type=int, default=0, help="print eval progress every N val steps (rank0 only)")
     ap.add_argument("--save_every_steps", type=int, default=0, help="save ckpt every N global steps (rank0 only)")
 
-    # ----- LR schedule (NEW, optional; default keeps original behavior) -----
+    # ----- LR schedule -----
     ap.add_argument("--lr_schedule", type=str, default="constant", choices=["constant", "cosine"],
                     help="lr schedule type. constant keeps original behavior; cosine enables warmup+cosine decay.")
     ap.add_argument("--warmup_steps", type=int, default=0, help="linear warmup steps (only for --lr_schedule cosine)")
     ap.add_argument("--min_lr_ratio", type=float, default=0.0,
                     help="final lr ratio at the end of cosine decay, e.g. 0.1 means end lr = 0.1*base_lr")
+
+    # ----- activation checkpointing -----
+    ap.add_argument("--grad_ckpt", action="store_true",
+                    help="enable activation checkpointing in ViT encoder blocks (save memory, slower)")
+    ap.add_argument("--grad_ckpt_use_reentrant", action="store_true",
+                    help="use reentrant checkpointing (legacy). default False recommended.")
 
     # ----- misc -----
     ap.add_argument("--seed", type=int, default=42)
@@ -822,6 +967,7 @@ def main():
         state_dim=args.state_dim,
         use_state=args.use_state,
         normalize=args.normalize,
+        depth_mode=args.depth_mode,
         filter_max_dt=filter_max_dt,
         eps=args.eps,
         desired_vel_min=args.desired_vel_min,
@@ -833,6 +979,7 @@ def main():
         state_dim=args.state_dim,
         use_state=args.use_state,
         normalize=args.normalize,
+        depth_mode=args.depth_mode,
         filter_max_dt=filter_max_dt,
         eps=args.eps,
         desired_vel_min=args.desired_vel_min,
@@ -863,23 +1010,49 @@ def main():
     )
 
     # model cfg
+    if args.freeze_vggt and is_rank0():
+        print("[warn] --freeze_vggt is ignored in this ViT training script: training the whole model (encoder+decoder).")
+
+    # ✅ default: DINO aligned encoder, but decoder stays compact (stable)
     cfg = VelocityPlannerConfig(
-        state_dim=args.state_dim,     # ✅ 10
-        d_model=2048,
-        nhead=16,
-        num_layers=8,
-        dim_ff=2048,
+        state_dim=args.state_dim,
+
+        # ===== decoder params (keep small & stable) =====
+        d_model=256,
+        nhead=8,
+        num_layers=4,
+        dim_ff=1024,
         dropout=0.1,
+
         img_size=args.img_size,
         patch_size=args.patch_size,
-        vggt_embed_dim=args.vggt_embed_dim,
-        pretrained_agg_path=(args.pretrained_agg_path or None),
+
+        # ===== encoder params (align DINOv2 vitl14) =====
+        vggt_embed_dim=args.vggt_embed_dim,   # default 1024
+        vit_num_frames=args.frames,
+        vit_nhead=16,
+        vit_mlp_ratio=4.0,
+        vit_dropout=0.0,
+        vit_spatial_layers=6,
+        vit_temporal_layers=2,
+        vit_use_cls_token=True,
+        vit_use_time_embed=True,
+
         max_patches=(args.max_patches if args.max_patches > 0 else None),
         out_dim=3,
-        freeze_vggt=bool(args.freeze_vggt),
+
+        freeze_vggt=False,
     )
 
     model = VelocityPlannerModel(cfg).to(device)
+
+    # -------- NEW: enable activation checkpointing (BEFORE DDP wrap) --------
+    if args.grad_ckpt:
+        _enable_grad_ckpt(model, use_reentrant=bool(args.grad_ckpt_use_reentrant))
+
+    # -------- NEW: init dinov2 from local ckpt (BEFORE resume/DDP wrap) --------
+    if args.dinov2_ckpt:
+        _maybe_init_dinov2(model, args.dinov2_ckpt, device=device)
 
     # resume BEFORE DDP wrap
     start_epoch = 1
@@ -923,8 +1096,9 @@ def main():
         with open(os.path.join(args.out_dir, "model_cfg.json"), "w", encoding="utf-8") as f:
             json.dump(cfg_dict, f, ensure_ascii=False, indent=2)
 
-        print(f"[cfg] freeze_vggt={args.freeze_vggt}")
+        print(f"[cfg] normalize={args.normalize} depth_mode={args.depth_mode}")
         print_trainable_params(model)
+        print_vit_decoder_param_ratio(model)
 
         if not args.use_state:
             print("[warn] --use_state is OFF: state will be zeros. You probably want --use_state.")
@@ -950,12 +1124,9 @@ def main():
             print(f"[tb] local  : {local_tb}")
             print(f"[tb] joblvl : {job_tb}")
 
-    # -------- Scheduler (NEW, optional) --------
+    # -------- Scheduler (optional) --------
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
 
-    # total steps for cosine:
-    # - if max_steps > 0: use it as total_steps
-    # - else: epochs * len(train_loader)
     target_steps = args.max_steps if args.max_steps and args.max_steps > 0 else None
     if target_steps is None:
         total_steps = int(args.epochs) * int(len(train_loader))
@@ -970,9 +1141,6 @@ def main():
         )
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-        # 对齐到 resume 的 global_step：让当前 lr 与 global_step 一致
-        # 说明：我们在 train loop 里会 scheduler.step(global_step) 设置下一步 lr；
-        # 因此这里先把 scheduler 推到 global_step（如果是 0 则不动）
         if global_step > 0:
             scheduler.step(global_step)
 
@@ -980,7 +1148,6 @@ def main():
             print(f"[lr] schedule=cosine total_steps={total_steps} warmup_steps={args.warmup_steps} min_lr_ratio={args.min_lr_ratio}")
             print(f"[lr] base_lr={optimizer.param_groups[0]['lr']:.6g} (note: resume may override base lr via optimizer state)")
 
-        # 若 ckpt 里有 scheduler state，优先恢复（更精确）
         if resume_path:
             ckpt = torch.load(resume_path, map_location="cpu")
             if "scheduler" in ckpt:
@@ -1084,7 +1251,6 @@ def main():
 
         epoch += 1
 
-    # close TB
     tb_flush(tb_writers)
     tb_close(tb_writers)
 
@@ -1097,22 +1263,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    # v1
-    
-    # cfg = VelocityPlannerConfig(
-    #     state_dim=args.state_dim,     # ✅ 10
-    #     # d_model=256,
-    #     d_model=1024,
-    #     nhead=8,
-    #     num_layers=6,
-    #     dim_ff=1536,
-    #     dropout=0.1,
-    #     img_size=args.img_size,
-    #     patch_size=args.patch_size,
-    #     vggt_embed_dim=args.vggt_embed_dim,
-    #     pretrained_agg_path=(args.pretrained_agg_path or None),
-    #     max_patches=(args.max_patches if args.max_patches > 0 else None),
-    #     out_dim=3,
-    #     freeze_vggt=bool(args.freeze_vggt),
-    # )

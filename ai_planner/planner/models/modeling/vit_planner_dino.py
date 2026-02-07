@@ -24,6 +24,12 @@ VelocityPlannerModel
   - encoder forward 可选 no_grad（省显存）：cfg.encoder_no_grad=True
 
 新增（本次）：
+- Encoder 可选从 DINOv2 初始化（只初始化单帧/空间部分）：
+    cfg.encoder_init_dinov2=True
+    cfg.encoder_dinov2_model_name="dinov2_vitl14"
+    cfg.encoder_dinov2_local_ckpt_path="/path/to/dinov2_vitl14.pth"  # 可选，离线加载
+  注意：要与 DINOv2 对齐，默认 vit_embed_dim=1024, vit_nhead=16, patch_size=14
+
 - Activation checkpointing 接口：
     model.gradient_checkpointing_enable(enabled=True, use_reentrant=False, target="encoder")
   优先把开关向下传给 ViT4FrameEncoder（推荐 encoder 内实现 block-level checkpoint）。
@@ -40,10 +46,10 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 # NEW: use your ViT encoder
-from ..encoder.vision_encoder import ViT4FrameEncoder, ViT4FrameEncoderConfig
+from ..encoder.vision_encoder_dino import ViT4FrameEncoder, ViT4FrameEncoderConfig
 
 from ..connector.connector import VGGTConnector
-from ..decoder.traj_decoder import PlannerDecoder, VelocityHead, VelocityHeadTanh, VelocityHeadUnit
+from ..decoder.traj_decoder import PlannerDecoder, VelocityHead, VelocityHeadTanh
 
 
 class StateFourierEmbedding(nn.Module):
@@ -104,18 +110,25 @@ class VelocityPlannerConfig:
     patch_size: int = 14
 
     # NOTE: 字段名保留 vggt_embed_dim，但现在表示 vit_embed_dim（E）
+    # ✅ 默认与 DINOv2 ViT-L/14 对齐：E=1024
     # 输出特征维仍然是 2*E，保证 connector 能无缝接上
-    vggt_embed_dim: int = 256
+    vggt_embed_dim: int = 1024
 
-    # ViT 超参：为了让 encoder 参数量 ≈ decoder，这里默认做“小 ViT”
+    # ViT 超参：默认与 DINOv2 vitl14 对齐（heads=16）
     vit_num_frames: int = 4
-    vit_nhead: int = 8
+    vit_nhead: int = 16
     vit_mlp_ratio: float = 4.0
     vit_dropout: float = 0.0
-    vit_spatial_layers: int = 2     # 帧内 attention 层数（小）
-    vit_temporal_layers: int = 1    # 跨帧 attention 层数（小）
+    vit_spatial_layers: int = 6     # 你可以按算力调小/调大；用于跨域 finetune 通常 2~12
+    vit_temporal_layers: int = 2
     vit_use_cls_token: bool = True
     vit_use_time_embed: bool = True
+
+    # ---------- encoder init (optional) ----------
+    encoder_init_dinov2: bool = False
+    encoder_dinov2_model_name: str = "dinov2_vitl14"
+    # 离线加载：指向本地 dinov2 checkpoint（可为空则走 torch.hub 或 cache）
+    encoder_dinov2_local_ckpt_path: Optional[str] = None
 
     # ---------- connector ----------
     max_patches: Optional[int] = None
@@ -129,11 +142,8 @@ class VelocityPlannerConfig:
     encoder_no_grad: bool = True
 
     # ---------- activation checkpointing ----------
-    # 是否启用 activation checkpointing（优先传给 encoder；否则 fallback 在本文件做整段 checkpoint）
     activation_checkpointing: bool = False
-    # torch.utils.checkpoint.use_reentrant（PyTorch2.0+ 推荐 False）
     activation_ckpt_use_reentrant: bool = False
-    # 目前默认只对 encoder 相关路径启用
     activation_ckpt_target: str = "encoder"  # {"encoder","all"}
 
 
@@ -163,7 +173,7 @@ class VelocityPlannerModel(nn.Module):
             img_size=cfg.img_size,
             patch_size=cfg.patch_size,
             num_frames=cfg.vit_num_frames,
-            embed_dim=cfg.vggt_embed_dim,     # E
+            embed_dim=cfg.vggt_embed_dim,     # E (default 1024 aligns with DINOv2 ViT-L/14)
             out_dim=None,                    # -> 2*E
             nhead=cfg.vit_nhead,
             mlp_ratio=cfg.vit_mlp_ratio,
@@ -174,6 +184,17 @@ class VelocityPlannerModel(nn.Module):
             use_time_embed=cfg.vit_use_time_embed,
         )
         self.vggt = ViT4FrameEncoder(vit_cfg)
+
+        # 2.1) Optional: init encoder spatial part from DINOv2 (single-frame init)
+        if cfg.encoder_init_dinov2:
+            try:
+                self.vggt.init_from_dinov2(
+                    model_name=cfg.encoder_dinov2_model_name,
+                    local_ckpt_path=cfg.encoder_dinov2_local_ckpt_path,
+                    verbose=True,
+                )
+            except Exception as e:
+                print("[WARN] init_from_dinov2 failed:", repr(e))
 
         # encoder 输出 dim = 2*E（对齐你原 connector 习惯）
         vggt_out_dim = 2 * cfg.vggt_embed_dim
@@ -202,9 +223,8 @@ class VelocityPlannerModel(nn.Module):
             use_self_attn=False,
             pre_norm=True,
         )
-        # self.head = VelocityHead(d_model=cfg.d_model, out_dim=cfg.out_dim)
+        self.head = VelocityHead(d_model=cfg.d_model, out_dim=cfg.out_dim)
         # self.head = VelocityHeadTanh(d_model=cfg.d_model, out_dim=cfg.out_dim)
-        self.head = VelocityHeadUnit(d_model=cfg.d_model, out_dim=cfg.out_dim)
 
         # 5) Freeze ONLY encoder. Connector/Decoder/Head keep trainable.
         if cfg.freeze_vggt:
@@ -216,7 +236,6 @@ class VelocityPlannerModel(nn.Module):
 
         # 6) Activation checkpointing (optional)
         if cfg.activation_checkpointing:
-            # 这里会把开关尽量向下传给 encoder；否则 forward 里会 fallback
             self.gradient_checkpointing_enable(
                 enabled=True,
                 use_reentrant=cfg.activation_ckpt_use_reentrant,
@@ -249,7 +268,6 @@ class VelocityPlannerModel(nn.Module):
                 self.vggt.gradient_checkpointing_enable(enabled=bool(enabled), use_reentrant=bool(use_reentrant))
                 self._fallback_ckpt_encoder = False
             except TypeError:
-                # older signature
                 self.vggt.gradient_checkpointing_enable(bool(enabled))
                 self._fallback_ckpt_encoder = False
         elif hasattr(self.vggt, "set_gradient_checkpointing"):
@@ -287,7 +305,7 @@ class VelocityPlannerModel(nn.Module):
             with torch.no_grad():
                 return self.vggt(images)
 
-        # Case 2) activation checkpointing (encoder)
+        # Case 2) activation checkpointing (encoder) fallback
         if (
             self.cfg.activation_checkpointing
             and getattr(self, "_fallback_ckpt_encoder", False)
@@ -314,24 +332,15 @@ class VelocityPlannerModel(nn.Module):
         return_attn: bool = False,
     ):
         # ---- 1) encode images (ViT) ----
-        # vggt_feat: [B,S,N,2E], patch_start_idx: int
         vggt_feat, patch_start_idx = self._encode_images(images)
 
         # ---- 2) build KV from patch tokens (last frame) ----
-        # kv: [B, P_patch, d_model]
-        # 注意：connector 通常不太吃显存，主要是 encoder/decoder
         kv = self.connector(vggt_feat, patch_start_idx)
-
-        # PlannerDecoder 期望 img_feat: [B,S,P,D] 并内部取 S=-1
         img_feat_for_decoder = kv.unsqueeze(1)  # [B,1,P_patch,D]
 
         # ---- 3) build Q from state ----
         state_emb = self.state_embed(state)  # -> [B,d_model] or [B,S,d_model]
-
-        if state_emb.dim() == 3:
-            q_embed = state_emb[:, -1, :]
-        else:
-            q_embed = state_emb
+        q_embed = state_emb[:, -1, :] if state_emb.dim() == 3 else state_emb
 
         # ---- 4) decode ----
         if return_attn:
@@ -370,15 +379,20 @@ if __name__ == "__main__":
         img_size=518,
         patch_size=14,
 
-        # encoder (small ViT to match decoder param scale)
-        vggt_embed_dim=256,           # vit_embed_dim = 256  -> encoder out_dim=512
+        # ✅ default aligns with DINOv2 vitl14
+        vggt_embed_dim=1024,
         vit_num_frames=4,
-        vit_nhead=8,
-        vit_spatial_layers=2,
-        vit_temporal_layers=1,
+        vit_nhead=16,
+        vit_spatial_layers=6,
+        vit_temporal_layers=2,
         vit_dropout=0.0,
         vit_use_cls_token=True,
         vit_use_time_embed=True,
+
+        # init from dinov2 (optional)
+        encoder_init_dinov2=False,
+        encoder_dinov2_model_name="dinov2_vitl14",
+        encoder_dinov2_local_ckpt_path=None,  # "/path/to/dinov2_vitl14.pth"
 
         max_patches=512,
         out_dim=3,
@@ -395,7 +409,6 @@ if __name__ == "__main__":
     model = VelocityPlannerModel(cfg).to(device)
     model.train()
 
-    # also callable from outside
     model.gradient_checkpointing_enable(True, use_reentrant=False, target="encoder")
 
     B, S = 2, 4

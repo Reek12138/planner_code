@@ -67,3 +67,4 @@ third_party/**
 # train（排除指定脚本）
 ############################
 train/run2fuyao.sh
+train/run_diffusion2fuyao.sh

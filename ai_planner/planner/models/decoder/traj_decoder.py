@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
+import torch.nn.functional as F
+
 class StateFourierEmbedding(nn.Module):
     def __init__(self, in_dim=7, num_freq=16, out_dim=256):
         super().__init__()
@@ -260,3 +262,23 @@ class VelocityHeadTanh(nn.Module):
         else:
             raise ValueError(f"q must be [B,D] or [B,Nq,D], got {q.shape}")
         return 1.2*torch.tanh(self.mlp(q0))  # [-1,1]
+
+
+class VelocityHeadUnit(nn.Module):
+    def __init__(self, d_model: int, out_dim: int = 3, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, out_dim),
+        )
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        if q.dim() == 3:
+            q = q[:, 0, :]   # [B, D]
+
+        v = self.mlp(q)          # [B,3]
+        # v = torch.tanh(v)        # stabilize
+        v = F.normalize(v, dim=-1, eps=self.eps)  # ★关键
+        return v                 # 单位向量
