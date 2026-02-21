@@ -25,6 +25,17 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 try:
+    from PIL import Image
+except Exception as e:
+    raise RuntimeError("PIL is required: pip install pillow") from e
+
+try:
+    import torchvision.transforms.functional as TF
+    _HAS_TV = True
+except Exception:
+    _HAS_TV = False
+
+try:
     from torch.utils.tensorboard import SummaryWriter
     _HAS_TB = True
 except Exception:
@@ -106,26 +117,25 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
     return items
 
 def _resize_tensor_chw(x: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
-    try:
-        import torchvision.transforms.functional as TF
+    if _HAS_TV:
         return TF.resize(x, size_hw, antialias=True)
-    except:
-        from PIL import Image
+    
+    c, h, w = x.shape
+    outs = []
+    for i in range(c):
+        img = Image.fromarray((x[i].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8"))
+        img = img.resize((size_hw[1], size_hw[0]), resample=Image.BILINEAR)
         import numpy as np
-        c, h, w = x.shape
-        outs = []
-        for i in range(c):
-            img = Image.fromarray((x[i].clamp(0, 1).cpu().numpy() * 255.0).astype("uint8"))
-            img = img.resize((size_hw[1], size_hw[0]), resample=Image.BILINEAR)
-            arr = torch.from_numpy(np.array(img)).float() / 255.0
-            outs.append(arr)
-        return torch.stack(outs, dim=0)
+        arr = torch.from_numpy(np.array(img)).float() / 255.0
+        outs.append(arr)
+    return torch.stack(outs, dim=0)
 
 def load_depth_png_as_3ch_tensor(
     path: str,
     img_size: int,
     normalize: str = "unit",
 ) -> torch.Tensor:
+    # NOTE: imports must be inside function for multiprocessing workers
     from PIL import Image
     import numpy as np
     
@@ -149,6 +159,10 @@ def load_depth_png_as_3ch_tensor(
         mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
         std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
         x = (x - mean) / std
+    elif normalize in ("unit", "none"):
+        pass
+    else:
+        raise ValueError(f"Unknown normalize={normalize}")
 
     return x.float()
 
@@ -298,7 +312,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     device: str,
     grad_clip: float,
     log_every: int,
@@ -324,9 +338,10 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=str(device).startswith("cuda")):
-            # Diffusion forward pass
-            loss, metrics = model.forward_train(images, state, label)
+        with torch.amp.autocast('cuda', enabled=str(device).startswith("cuda")):
+            # Diffusion forward pass (use unwrap_model for DDP compatibility)
+            m = unwrap_model(model)
+            loss, metrics = m.forward_train(images, state, label)
 
         scaler.scale(loss).backward()
 
@@ -388,8 +403,9 @@ def evaluate(
         label = batch["label"].to(device, non_blocking=True)
         label_den = batch["label_den"].to(device, non_blocking=True)
 
-        # Diffusion inference
-        pred = model.forward_inference(images, state, num_steps=num_inference_steps)
+        # Diffusion inference (use unwrap_model for DDP compatibility)
+        m = unwrap_model(model)
+        pred = m.forward_inference(images, state, num_steps=num_inference_steps)
         
         # Compute loss on denormalized values
         den = label_den.view(-1, 1).clamp_min(1e-6)
@@ -550,7 +566,7 @@ def main():
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=str(device).startswith("cuda"),
         collate_fn=collate_fn,
         drop_last=True,
     )
@@ -560,7 +576,7 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=str(device).startswith("cuda"),
         collate_fn=collate_fn,
         drop_last=False,
     )
@@ -613,7 +629,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=str(device).startswith("cuda"))
+    scaler = torch.amp.GradScaler('cuda', enabled=str(device).startswith("cuda"))
 
     if resume_path and os.path.exists(resume_path):
         ckpt = torch.load(resume_path, map_location="cpu")
