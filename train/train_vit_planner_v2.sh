@@ -25,14 +25,14 @@ torchrun --nproc_per_node=4 train_vit_planner_v2.py \
   --use_rope \
   --use_2x2_compression \
   --compression_num_layers 2 \
-  --out_dir  /workspace/group_share/adc-perception-mlinfra/zhuy25/ai_planner/output/20260221_vit_planner_v1_128_rope_compression \
+  --out_dir  /workspace/group_share/adc-perception-mlinfra/zhuy25/ai_planner/output/20260221_vit_planner_v2_140_rope_compression \
   --tensorboard \
   --val_log_every 10 \
   --val_print_denorm_n 20 \
-  --save_every_steps 2000 \
-  --epochs 50 \
-  --batch_size 32 \
-  --num_workers 16 \
+  --save_every_steps 5000 \
+  --epochs 100 \
+  --batch_size 64 \
+  --num_workers 32 \
   --lr 1e-6 \
   --lr_schedule cosine \
   --warmup_steps 2000 \
